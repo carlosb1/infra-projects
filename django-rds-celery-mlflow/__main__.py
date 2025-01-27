@@ -23,6 +23,9 @@ availability_zone = aws.config.region
 django_admin_name = config.require("django-admin-name")
 django_admin_password = config.require_secret("django-admin-password")
 
+# redis parameters
+redis_port = config.require("redis-port")
+
 
 pulumi.info(f"Running the configuration in this region {availability_zone}")
 
@@ -176,6 +179,7 @@ app_database_subnetgroup = aws.rds.SubnetGroup(
     "app-database-subnetgroup", subnet_ids=[app_vpc_subnet.id, extra_rds_subnet.id]
 )
 
+#
 # An RDS instnace is created to hold our MySQL database
 mysql_rds_server = aws.rds.Instance(
     "mysql-server",
@@ -256,6 +260,12 @@ django_listener = aws.lb.Listener(
     ],
 )
 
+# Creating a Cloudwatch instance to store the logs that the ECS services produce
+django_log_group = aws.cloudwatch.LogGroup(
+    "django-log-group", retention_in_days=1, name="django-log-group"
+)
+
+
 # Creating a Docker image from "./frontend/Dockerfile", which we will use
 # to upload our app
 
@@ -275,13 +285,62 @@ def get_registry_info(rid):
     )
 
 
-pulumi.info("Getting registy info")
-
-
 app_registry = app_ecr_repo.registry_id.apply(get_registry_info)
 
 
-pulumi.info(f"Got app registry info")
+# Redis Container (local for now, can use Elasticache for managed Redis)
+
+# Create an ECS task definition for Redis
+redis_task_definition = aws.ecs.TaskDefinition("redis-task",
+    family="redis",
+    network_mode="awsvpc",
+    execution_role_arn=app_exec_role.arn,
+    task_role_arn=app_task_role.arn,
+    container_definitions=json.dumps([{
+        "name": "redis",
+        "image": "redis:alpine",
+        "memory": 512,
+        "cpu": 256,
+        "essential": True,
+        "portMappings": [{
+            "containerPort": redis_port,
+            "hostPort": redis_port,
+            "protocol": "tcp"
+        }],
+        "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+                "awslogs-group": "django-log-group",
+                "awslogs-region": availability_zone,
+                "awslogs-stream-prefix": "djangoApp-redis",
+            },
+        },
+        "healthCheck": {{
+            "command": ["CMD-SHELL", "redis-cli ping || exit 1"],  # Redis health check command
+            "interval": 30,  # Run health check every 30 seconds
+            "timeout": 5,  # Timeout for health check command
+            "retries": 3,  # Retry 3 times before marking unhealthy
+            "startPeriod": 10  # Grace period before starting health checks
+        }},
+    }]),
+    requires_compatibilities=["FARGATE"],
+    cpu="256",
+    memory="512"
+   )
+
+# Create an ECS service for Redis
+redis_service = aws.ecs.Service("redis-service",
+    cluster=app_cluster.arn,
+    desired_count=1,
+    launch_type="FARGATE",
+    task_definition=redis_task_definition.arn,
+    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+        assign_public_ip=True,
+        subnets=[app_vpc_subnet.id],
+        security_groups=[app_security_group.id],
+    ),
+
+)
 
 
 django_image = docker.Image(
@@ -295,82 +354,6 @@ django_image = docker.Image(
     registry=app_registry,
 )
 
-
-# Creating a Cloudwatch instance to store the logs that the ECS services produce
-django_log_group = aws.cloudwatch.LogGroup(
-    "django-log-group", retention_in_days=1, name="django-log-group"
-)
-
-# Creating a task definition for the first Django instance. This task definition
-# will migrate the database, create a site admin account, and will automatcially
-# exit when it is finished.
-django_database_task_definition = aws.ecs.TaskDefinition(
-    "django-database-task-definition",
-    family="django_database_task_definition-family",
-    cpu="256",
-    memory="512",
-    network_mode="awsvpc",
-    requires_compatibilities=["FARGATE"],
-    execution_role_arn=app_exec_role.arn,
-    task_role_arn=app_task_role.arn,
-    container_definitions=pulumi.Output.json_dumps(
-        [
-            {
-                "name": "django-container",
-                "image": django_image.image_name,
-                "memory": 512,
-                "essential": True,
-                "portMappings": [{"containerPort": 80, "hostPort": 80, "protocol": "tcp"}],
-                "environment": [
-                 #   {"name": "SECRET_KEY", "value": django_secret_key}, //TODO pending to add
-                    {"name": "DATABASE_NAME", "value": mysql_database.name},
-                    {"name": "USER_NAME", "value": sql_admin_name},
-                    {"name": "USER_PASSWORD", "value": sql_admin_password},
-                    {"name": "DJANGO_NAME", "value": django_admin_name},
-                    {"name": "DJANGO_PASSWORD", "value": django_admin_password},
-                    {"name": "DATABASE_ADDRESS", "value": mysql_rds_server.address},
-                    {
-                        "name": "DATABASE_PORT",
-                        "value": mysql_rds_server.port.apply(lambda x: str(int(x))),
-                    },
-                    {"name": "ALLOWED_HOSTS", "value": [django_balancer.dns_name]},
-                ],
-                "logConfiguration": {
-                    "logDriver": "awslogs",
-                    "options": {
-                        "awslogs-group": "django-log-group",
-                        "awslogs-region": "eu-west-1",
-                        "awslogs-stream-prefix": "djangoApp-database",
-                    },
-                },
-                "command": ["sh", "-c", "cd /app && ./set_up_database.sh"],
-            }
-        ]
-    ),
-)
-
-# Launching our Django service on Fargate, using our configurations and load balancers
-django_database_service = aws.ecs.Service(
-    "django-database-service",
-    cluster=app_cluster.arn,
-    desired_count=1,
-    launch_type="FARGATE",
-    task_definition=django_database_task_definition.arn,
-    wait_for_steady_state=False,
-    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
-        assign_public_ip=True,
-        subnets=[app_vpc_subnet.id],
-        security_groups=[app_security_group.id],
-    ),
-    load_balancers=[
-        aws.ecs.ServiceLoadBalancerArgs(
-            target_group_arn=django_targetgroup.arn,
-            container_name="django-container",
-            container_port=80,
-        )
-    ],
-    opts=pulumi.ResourceOptions(depends_on=[django_listener]),
-)
 
 # Creating a task definition for the second Django instance. This instance will
 # act as the server, and will run indefinately
@@ -401,19 +384,30 @@ django_site_task_definition = aws.ecs.TaskDefinition(
                         "name": "DATABASE_PORT",
                         "value": mysql_rds_server.port.apply(lambda x: str(int(x))),
                     },
+                    {"name": "ALLOWED_HOSTS", "value": str(django_balancer.dns_name)},
                 ],
                 "logConfiguration": {
                     "logDriver": "awslogs",
                     "options": {
                         "awslogs-group": "django-log-group",
-                        "awslogs-region": "eu-west-1",
+                        "awslogs-region": availability_zone,
                         "awslogs-stream-prefix": "djangoApp-site",
                     },
                 },
+                "healthCheck": {{
+                    "command": ["CMD-SHELL", "curl -f http://localhost:80/health/ || exit 1"],
+                    "interval": 30,  # Health check runs every 30 seconds
+                    "timeout": 5,  # Health check must respond within 5 seconds
+                    "retries": 3,  # Mark unhealthy after 3 failed attempts
+                    "startPeriod": 10  # Grace period after container start before checks
+                }},
+                "command": ["sh", "-c", "cd /app && env $(cat .env | xargs)  ./set_up_database.sh 2>output.log"],
             }
         ]
     ),
 )
+
+
 
 # Launching our Django service on Fargate, using our configurations and load balancers
 django_site_service = aws.ecs.Service(
@@ -441,3 +435,4 @@ django_site_service = aws.ecs.Service(
 # Exporting the url of our Django site. We can now connect to our app. To access
 # Django administration, add "/admin/" to the end of the url.
 pulumi.export("app-url", django_balancer.dns_name)
+pulumi.export("rds_endpoint", mysql_rds_server.endpoint)
