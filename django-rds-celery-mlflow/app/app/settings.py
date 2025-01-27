@@ -12,6 +12,9 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 
 from pathlib import Path
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -27,27 +30,21 @@ SECRET_KEY = 'django-insecure-zr%6g&0%%@$s5^swzymg21r#5i31t$og_(p8*a+86erf3v2w2f
 DEBUG = True
 
 
-new_allow_hosts = os.getenv('ALLOWED_HOSTS', [])
+new_allow_hosts = os.getenv('ALLOWED_HOSTS', '')
 
-ALLOWED_HOSTS = ['0.0.0.0', '127.0.0.1', 'app']
-
-ALLOWED_HOSTS.extend(new_allow_hosts)
+logger.info(f"Received allowed hos : {new_allow_hosts}")
 
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.environ['DATABASE_NAME'],
-        'USER': os.environ['USER_NAME'],
-        'PASSWORD': os.environ['USER_PASSWORD'],
-        'HOST': os.environ['DATABASE_ADDRESS'],
-        'PORT': os.environ['DATABASE_PORT'],
-    }
-}
+# TODO test this param for loading hosts
+ALLOWED_HOSTS = ['*']
+
+
+if new_allow_hosts:
+    ALLOWED_HOSTS.append(new_allow_hosts)
+
 
 
 # Application definition
-
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -55,7 +52,10 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'health_check',
+    'documents'
 ]
+
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -91,12 +91,36 @@ WSGI_APPLICATION = 'app.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
 
+# We have three types of configuration.
+# - Locally without docker
+# - Locally via docker
+# - With pulumi
+
+
+# database configuration
+
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': os.getenv('DATABASE_ENGINE', default='django.db.backends.sqlite3'),
+        'NAME': os.getenv('DATABASE_NAME', default= BASE_DIR / 'db.sqlite3'),
+        'USER': os.getenv('USER_NAME', default=''),
+        'PASSWORD': os.getenv('USER_PASSWORD', default=''),
+        'HOST': os.getenv('DATABASE_ADDRESS', default=''),
+        'PORT': os.getenv('DATABASE_PORT', default=''),
     }
 }
+
+# celery configuration
+REDIS_HOST = os.getenv('REDIS_HOST', default='0.0.0.0')
+REDIS_PORT = os.getenv('REDIS_PORT', default='6379')
+
+CELERY_BROKER_URL = f'redis://{REDIS_HOST}:{REDIS_PORT}/0'
+CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+# Celery settings
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+
+
 
 
 # Password validation

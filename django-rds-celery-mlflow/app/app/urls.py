@@ -17,6 +17,13 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path
 
+from documents.views import document_upload
+from health_check.views import health_check
+
+
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('', document_upload, name='document_upload'),  # Home view
+    path("health/", health_check, name="health_check"),
 ]

@@ -2,3 +2,5 @@ Django
 mysqlclient
 pulumi
 pulumi_aws
+redis
+celery
