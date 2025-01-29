@@ -3,7 +3,7 @@
  env $(cat .env | xargs) ./set_up_database.sh
  
 # Setting up secrets
- env $(cat .env | xargs) ./set_up_secrets.sh
+ env $(cat .env | xargs) ./set_up_params.sh
  
 
 # TODOS

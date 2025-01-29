@@ -14,6 +14,7 @@ from pulumi_docker import RegistryArgs
 config = pulumi.Config()
 sql_admin_name = config.require("sql-admin-name")
 sql_admin_password = config.require_secret("sql-admin-password")
+sql_database_name = config.require("sql-database-name")
 # Setting user examples
 sql_user_name = config.require("sql-user-name")
 sql_user_password = config.require_secret("sql-user-password")
@@ -26,10 +27,12 @@ django_admin_password = config.require_secret("django-admin-password")
 # redis parameters
 redis_port = config.require("redis-port")
 
+# TODO Add 80 port mapping
 
 pulumi.info(f"Running the configuration in this region {availability_zone}")
 
 # A random 50-character string
+
 # django_secret_key = config.require_secret("django-secret-key")
 
 # The ECS cluster in which our application and databse will run
@@ -45,6 +48,14 @@ app_vpc_subnet = aws.ec2.Subnet(
     vpc_id=app_vpc.id,
 )
 
+#TODO add two subnets
+# Creating an RDS instance requires having two subnets
+extra_rds_subnet = aws.ec2.Subnet(
+    "extra-rds-subnet",
+    cidr_block="172.31.128.0/20",
+    availability_zone="eu-west-1b",
+    vpc_id=app_vpc.id,
+)
 
 # Creating a gateway to the web for the VPC
 app_gateway = aws.ec2.InternetGateway("app-gateway", vpc_id=app_vpc.id)
@@ -166,14 +177,6 @@ app_lifecycle_policy = aws.ecr.LifecyclePolicy(
 
 # The application's backend and data layer: MySQL
 
-# Creating an RDS instance requires having two subnets
-extra_rds_subnet = aws.ec2.Subnet(
-    "extra-rds-subnet",
-    cidr_block="172.31.128.0/20",
-    availability_zone="eu-west-1b",
-    vpc_id=app_vpc.id,
-)
-
 # Both subnets are assigned to a SubnetGroup used by the RDS instance
 app_database_subnetgroup = aws.rds.SubnetGroup(
     "app-database-subnetgroup", subnet_ids=[app_vpc_subnet.id, extra_rds_subnet.id]
@@ -204,7 +207,7 @@ mysql_provider = mysql.Provider(
 
 # Initializing a basic database on the RDS instance
 mysql_database = mysql.Database(
-    "mysql-database", name="votes", opts=pulumi.ResourceOptions(provider=mysql_provider)
+    "mysql-database", name=sql_database_name, opts=pulumi.ResourceOptions(provider=mysql_provider)
 )
 
 # Creating a user which will be used to manage MySQL tables
@@ -222,7 +225,7 @@ mysql_access_grant = mysql.Grant(
     user=mysql_user.user,
     host=mysql_user.host,
     database=mysql_database.name,
-    privileges=["SELECT", "UPDATE", "INSERT", "DELETE"],
+    privileges=["SELECT", "UPDATE", "INSERT", "DELETE", "CREATE"],
     opts=pulumi.ResourceOptions(provider=mysql_provider),
 )
 
@@ -242,7 +245,7 @@ django_balancer = aws.lb.LoadBalancer(
     "django-balancer",
     load_balancer_type="network",
     internal=False,
-    security_groups=[],
+    security_groups=[app_security_group.id],  #TODO add security group
     subnets=[app_vpc_subnet.id],
 )
 
@@ -271,13 +274,11 @@ django_log_group = aws.cloudwatch.LogGroup(
 
 
 def get_registry_info(rid):
-    pulumi.info("Trying to get registry info")
     creds = aws.ecr.get_credentials(registry_id=rid)
     decoded = base64.b64decode(creds.authorization_token).decode()
     parts = decoded.split(':')
     if len(parts) != 2:
         raise Exception("Invalid credentials")
-    pulumi.info("Living the registry information")
     return RegistryArgs(
         server=creds.proxy_endpoint,
         username=parts[0],
@@ -287,61 +288,89 @@ def get_registry_info(rid):
 
 app_registry = app_ecr_repo.registry_id.apply(get_registry_info)
 
-
+#TODO try to use elasticcache
 # Redis Container (local for now, can use Elasticache for managed Redis)
 
+# Creating a target group through which the Django frontend receives requests
+redis_targetgroup = aws.lb.TargetGroup(
+    "redis-targetgroup",
+    port=int(redis_port),
+    protocol="TCP",
+    target_type="ip",
+    vpc_id=app_vpc.id,
+)
+
+# Creating a load balancer to spread out incoming requests
+redis_balancer = aws.lb.LoadBalancer(
+    "redis-balancer",
+    load_balancer_type="network",
+    internal=False,
+    security_groups=[app_security_group.id],  #TODO add security group
+    subnets=[app_vpc_subnet.id],
+)
+
+# Forwards all public traffic using port 80 to the Flask target group
+redis_listener = aws.lb.Listener(
+    "redis-listener",
+    load_balancer_arn=redis_balancer.arn,
+    port=int(redis_port),
+    protocol="TCP",
+    default_actions=[
+        aws.lb.ListenerDefaultActionArgs(
+            type="forward",
+            target_group_arn=redis_targetgroup.arn,
+        )
+    ],
+)
+
+# todo use elasticcache
 # Create an ECS task definition for Redis
 redis_task_definition = aws.ecs.TaskDefinition("redis-task",
-    family="redis",
-    network_mode="awsvpc",
-    execution_role_arn=app_exec_role.arn,
-    task_role_arn=app_task_role.arn,
-    container_definitions=json.dumps([{
-        "name": "redis",
-        "image": "redis:alpine",
-        "memory": 512,
-        "cpu": 256,
-        "essential": True,
-        "portMappings": [{
-            "containerPort": redis_port,
-            "hostPort": redis_port,
-            "protocol": "tcp"
-        }],
-        "logConfiguration": {
-            "logDriver": "awslogs",
-            "options": {
-                "awslogs-group": "django-log-group",
-                "awslogs-region": availability_zone,
-                "awslogs-stream-prefix": "djangoApp-redis",
-            },
-        },
-        "healthCheck": {{
-            "command": ["CMD-SHELL", "redis-cli ping || exit 1"],  # Redis health check command
-            "interval": 30,  # Run health check every 30 seconds
-            "timeout": 5,  # Timeout for health check command
-            "retries": 3,  # Retry 3 times before marking unhealthy
-            "startPeriod": 10  # Grace period before starting health checks
-        }},
-    }]),
-    requires_compatibilities=["FARGATE"],
-    cpu="256",
-    memory="512"
-   )
+                                               family="redis",
+                                               network_mode="awsvpc",
+                                               execution_role_arn=app_exec_role.arn,
+                                               task_role_arn=app_task_role.arn,
+                                               container_definitions=json.dumps([{
+                                                   "name": "redis",
+                                                   "image": "redis:alpine",
+                                                   "memory": 512,
+                                                   "cpu": 256,
+                                                   "essential": True,
+                                                   "portMappings": [{
+                                                       "containerPort": int(redis_port),
+                                                       "hostPort": int(redis_port),
+                                                       "protocol": "tcp"
+                                                   }],
+                                                   "logConfiguration": {
+                                                       "logDriver": "awslogs",
+                                                       "options": {
+                                                           "awslogs-group": "django-log-group",
+                                                           "awslogs-region": availability_zone,
+                                                           "awslogs-stream-prefix": "djangoApp-redis",
+                                                       },
+                                                   }
+                                               }]),
+                                               requires_compatibilities=["FARGATE"],
+                                               cpu="256",
+                                               memory="512"
+                                               )
 
 # Create an ECS service for Redis
 redis_service = aws.ecs.Service("redis-service",
-    cluster=app_cluster.arn,
-    desired_count=1,
-    launch_type="FARGATE",
-    task_definition=redis_task_definition.arn,
-    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
-        assign_public_ip=True,
-        subnets=[app_vpc_subnet.id],
-        security_groups=[app_security_group.id],
-    ),
+                                cluster=app_cluster.arn,
+                                desired_count=1,
+                                launch_type="FARGATE",
+                                task_definition=redis_task_definition.arn,
+                                network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+                                    assign_public_ip=True,
+                                    subnets=[app_vpc_subnet.id],
+                                    security_groups=[app_security_group.id],
+                                ),
 
-)
+                                )
 
+redis_dns_name = redis_balancer.dns_name
+django_dns_name = django_balancer.dns_name
 
 django_image = docker.Image(
     "django-dockerimage",
@@ -353,7 +382,6 @@ django_image = docker.Image(
     skip_push=False,
     registry=app_registry,
 )
-
 
 # Creating a task definition for the second Django instance. This instance will
 # act as the server, and will run indefinately
@@ -375,16 +403,21 @@ django_site_task_definition = aws.ecs.TaskDefinition(
                 "essential": True,
                 "portMappings": [{"containerPort": 80, "hostPort": 80, "protocol": "tcp"}],
                 "environment": [
-                #   {"name": "SECRET_KEY", "value": django_secret_key},
-                    {"name": "DATABASE_NAME", "value": mysql_database.name},
-                    {"name": "USER_NAME", "value": sql_user_name},
-                    {"name": "USER_PASSWORD", "value": sql_user_password},
+                    #   {"name": "SECRET_KEY", "value": django_secret_key},
+                    {"name": "DATABASE_ENGINE", "value": "django.db.backends.mysql"},
+                    {"name": "DJANGO_NAME", "value": django_admin_name},
+                    {"name": "DJANGO_PASSWORD", "value": django_admin_password},
+                    {"name": "DATABASE_NAME", "value": sql_database_name},
+                    {"name": "DB_USER_NAME", "value": sql_user_name},
+                    {"name": "DB_USER_PASSWORD", "value": sql_user_password},
                     {"name": "DATABASE_ADDRESS", "value": mysql_rds_server.address},
                     {
                         "name": "DATABASE_PORT",
                         "value": mysql_rds_server.port.apply(lambda x: str(int(x))),
                     },
-                    {"name": "ALLOWED_HOSTS", "value": str(django_balancer.dns_name)},
+                    {"name": "ALLOWED_HOSTS", "value": django_dns_name},  #TODO how to fix this?
+                    {"name": "REDIS_HOST", "value": redis_dns_name},
+                    {"name": "REDIS_PORT", "value": redis_port},
                 ],
                 "logConfiguration": {
                     "logDriver": "awslogs",
@@ -394,20 +427,11 @@ django_site_task_definition = aws.ecs.TaskDefinition(
                         "awslogs-stream-prefix": "djangoApp-site",
                     },
                 },
-                "healthCheck": {{
-                    "command": ["CMD-SHELL", "curl -f http://localhost:80/health/ || exit 1"],
-                    "interval": 30,  # Health check runs every 30 seconds
-                    "timeout": 5,  # Health check must respond within 5 seconds
-                    "retries": 3,  # Mark unhealthy after 3 failed attempts
-                    "startPeriod": 10  # Grace period after container start before checks
-                }},
-                "command": ["sh", "-c", "cd /app && env $(cat .env | xargs)  ./set_up_database.sh 2>output.log"],
+                "command": ["sh", "-c", "cd /app && ./set_up_database.sh && python manage.py runserver 0.0.0.0:80"],
             }
         ]
     ),
 )
-
-
 
 # Launching our Django service on Fargate, using our configurations and load balancers
 django_site_service = aws.ecs.Service(
@@ -429,10 +453,86 @@ django_site_service = aws.ecs.Service(
             container_port=80,
         )
     ],
-    opts=pulumi.ResourceOptions(depends_on=[django_listener]),
+    opts=pulumi.ResourceOptions(depends_on=[django_listener, mysql_rds_server]),
+)
+
+celery_image = docker.Image(
+    "celery-dockerimage",
+    image_name=app_ecr_repo.repository_url,
+    build=docker.DockerBuildArgs(
+        context='app',
+        platform='linux/amd64'
+    ),
+    skip_push=False,
+    registry=app_registry,
+)
+
+#TODO  add celery to monitorize
+
+# Creating a task definition for the second Django instance. This instance will
+# act as the server, and will run indefinately
+celery_site_task_definition = aws.ecs.TaskDefinition(
+    "celery-site-task-definition",
+    family="django-site-task-definition-family",
+    cpu="256",
+    memory="512",
+    network_mode="awsvpc",
+    requires_compatibilities=["FARGATE"],
+    execution_role_arn=app_exec_role.arn,
+    task_role_arn=app_task_role.arn,
+    container_definitions=pulumi.Output.json_dumps(
+        [
+            {
+                "name": "celery-container",
+                "image": celery_image.image_name,
+                "memory": 512,
+                "essential": True,
+                "environment": [
+                    {"name": "DATABASE_NAME", "value": sql_database_name},
+                    {"name": "DJANGO_NAME", "value": django_admin_name},
+                    {"name": "DJANGO_PASSWORD", "value": django_admin_password},
+                    {"name": "USER_NAME", "value": sql_user_name},
+                    {"name": "USER_PASSWORD", "value": sql_user_password},
+                    {"name": "DATABASE_ADDRESS", "value": mysql_rds_server.address},
+                    {
+                        "name": "DATABASE_PORT",
+                        "value": mysql_rds_server.port.apply(lambda x: str(int(x))),
+                    },
+                    {"name": "REDIS_HOST", "value": redis_dns_name},
+                    {"name": "REDIS_PORT", "value": redis_port},
+                ],
+                "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": {
+                        "awslogs-group": "django-log-group",
+                        "awslogs-region": availability_zone,
+                        "awslogs-stream-prefix": "djangoApp-celery",
+                    },
+                },
+                "command": ["sh", "-c", "cd app && celery -A app worker --loglevel=info"],
+            }
+        ]
+    ),
+)
+
+# Launching our Celery service on Fargate, using our configurations and load balancers
+celery_site_service = aws.ecs.Service(
+    "celery-site-service",
+    cluster=app_cluster.arn,
+    desired_count=1,
+    launch_type="FARGATE",
+    task_definition=celery_site_task_definition.arn,
+    wait_for_steady_state=False,
+    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+        assign_public_ip=True,
+        subnets=[app_vpc_subnet.id],
+        security_groups=[app_security_group.id],
+    ),
+    opts=pulumi.ResourceOptions(),
 )
 
 # Exporting the url of our Django site. We can now connect to our app. To access
 # Django administration, add "/admin/" to the end of the url.
-pulumi.export("app-url", django_balancer.dns_name)
+pulumi.export("app-url",  django_balancer.dns_name)
 pulumi.export("rds_endpoint", mysql_rds_server.endpoint)
+pulumi.export("secret value", django_admin_password)

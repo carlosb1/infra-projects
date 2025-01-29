@@ -32,7 +32,9 @@ DEBUG = True
 
 new_allow_hosts = os.getenv('ALLOWED_HOSTS', '')
 
-logger.info(f"Received allowed hos : {new_allow_hosts}")
+
+logger.info(f"Received allowed has : {new_allow_hosts}")
+
 
 
 # TODO test this param for loading hosts
@@ -103,12 +105,13 @@ DATABASES = {
     'default': {
         'ENGINE': os.getenv('DATABASE_ENGINE', default='django.db.backends.sqlite3'),
         'NAME': os.getenv('DATABASE_NAME', default= BASE_DIR / 'db.sqlite3'),
-        'USER': os.getenv('USER_NAME', default=''),
-        'PASSWORD': os.getenv('USER_PASSWORD', default=''),
+        'USER': os.getenv('DB_USER_NAME', default=''),
+        'PASSWORD': os.getenv('DB_USER_PASSWORD', default=''),
         'HOST': os.getenv('DATABASE_ADDRESS', default=''),
         'PORT': os.getenv('DATABASE_PORT', default=''),
     }
 }
+
 
 # celery configuration
 REDIS_HOST = os.getenv('REDIS_HOST', default='0.0.0.0')
@@ -121,6 +124,8 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 
 
+logger.info(f"database configuration={str(DATABASES)}")
+logger.info(f"Loading redis config: redis_host={REDIS_HOST} , redis_port={REDIS_PORT}")
 
 
 # Password validation

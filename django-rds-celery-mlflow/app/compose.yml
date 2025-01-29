@@ -1,6 +1,24 @@
 version: '3.8'
 
 services:
+  app:
+    build:
+      context: .
+    container_name: app
+    depends_on:
+      - redis
+      - mysql
+    working_dir: /app
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - MYSQL_ROOT_PASSWORD=${USER_PASSWORD}  # Root password
+      - MYSQL_DATABASE=${DATABASE_NAME}           # Database name
+      - DB_USER_NAME=${DB_USER_NAME}                   # MySQL user
+      - DB_USER_PASSWORD=${DB_USER_PASSWORD}           # MySQL user password
+    ports:
+      - "${APP_PORT:-80}:80"
+
   celery:
     build:
       context: .
@@ -12,6 +30,10 @@ services:
     environment:
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT}
+      - MYSQL_ROOT_PASSWORD=${USER_PASSWORD}  # Root password
+      - MYSQL_DATABASE=${DATABASE_NAME}           # Database name
+      - DB_USER_NAME=${DB_USER_NAME}                   # MySQL user
+      - DB_USER_PASSWORD=${DB_USER_PASSWORD}           # MySQL user password
     volumes:
       - .:/app
   redis:
@@ -26,7 +48,7 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: ${USER_PASSWORD}  # Root password
       MYSQL_DATABASE: ${DATABASE_NAME}           # Database name
-      MYSQL_USER: ${EX_USER_NAME}                   # MySQL user
-      MYSQL_PASSWORD: ${EX_USER_PASSWORD}           # MySQL user password
+      MYSQL_USER: ${DB_USER_NAME}                   # MySQL user
+      MYSQL_PASSWORD: ${DB_USER_PASSWORD}           # MySQL user password
     ports:
       - "${DATABASE_PORT:-3306}:3306" # Expose MySQL on the host machine
