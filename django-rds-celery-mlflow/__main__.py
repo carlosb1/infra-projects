@@ -31,6 +31,7 @@ redis_port = config.require("redis-port")
 
 pulumi.info(f"Running the configuration in this region {availability_zone}")
 
+
 # A random 50-character string
 
 # django_secret_key = config.require_secret("django-secret-key")
@@ -48,8 +49,6 @@ app_vpc_subnet = aws.ec2.Subnet(
     vpc_id=app_vpc.id,
 )
 
-#TODO add two subnets
-# Creating an RDS instance requires having two subnets
 extra_rds_subnet = aws.ec2.Subnet(
     "extra-rds-subnet",
     cidr_block="172.31.128.0/20",
@@ -178,9 +177,16 @@ app_lifecycle_policy = aws.ecr.LifecyclePolicy(
 # The application's backend and data layer: MySQL
 
 # Both subnets are assigned to a SubnetGroup used by the RDS instance
-app_database_subnetgroup = aws.rds.SubnetGroup(
-    "app-database-subnetgroup", subnet_ids=[app_vpc_subnet.id, extra_rds_subnet.id]
+db_subnetgroup = aws.rds.SubnetGroup(
+    "app-subnetgroup", subnet_ids=[app_vpc_subnet.id, extra_rds_subnet.id]
 )
+
+redis_subnet_group = aws.elasticache.SubnetGroup(
+    "redis-subnet-group",
+    subnet_ids=[app_vpc_subnet.id],  # Use your existing subnets
+    description="Subnet group for Redis ElastiCache"
+)
+
 
 #
 # An RDS instnace is created to hold our MySQL database
@@ -193,7 +199,7 @@ mysql_rds_server = aws.rds.Instance(
     allocated_storage=20,
     skip_final_snapshot=True,
     publicly_accessible=True,
-    db_subnet_group_name=app_database_subnetgroup.id,
+    db_subnet_group_name=db_subnetgroup.id,
     vpc_security_group_ids=[app_security_group.id],
 )
 
@@ -288,88 +294,18 @@ def get_registry_info(rid):
 
 app_registry = app_ecr_repo.registry_id.apply(get_registry_info)
 
-#TODO try to use elasticcache
-# Redis Container (local for now, can use Elasticache for managed Redis)
 
-# Creating a target group through which the Django frontend receives requests
-redis_targetgroup = aws.lb.TargetGroup(
-    "redis-targetgroup",
+redis_service = aws.elasticache.Cluster(
+    "redis-cluster",
+    engine="redis",
+    node_type="cache.t3.micro",
+    num_cache_nodes=1,
+    subnet_group_name=redis_subnet_group.id,
+    security_group_ids=[app_security_group.id],
     port=int(redis_port),
-    protocol="TCP",
-    target_type="ip",
-    vpc_id=app_vpc.id,
 )
 
-# Creating a load balancer to spread out incoming requests
-redis_balancer = aws.lb.LoadBalancer(
-    "redis-balancer",
-    load_balancer_type="network",
-    internal=False,
-    security_groups=[app_security_group.id],  #TODO add security group
-    subnets=[app_vpc_subnet.id],
-)
-
-# Forwards all public traffic using port 80 to the Flask target group
-redis_listener = aws.lb.Listener(
-    "redis-listener",
-    load_balancer_arn=redis_balancer.arn,
-    port=int(redis_port),
-    protocol="TCP",
-    default_actions=[
-        aws.lb.ListenerDefaultActionArgs(
-            type="forward",
-            target_group_arn=redis_targetgroup.arn,
-        )
-    ],
-)
-
-# todo use elasticcache
-# Create an ECS task definition for Redis
-redis_task_definition = aws.ecs.TaskDefinition("redis-task",
-                                               family="redis",
-                                               network_mode="awsvpc",
-                                               execution_role_arn=app_exec_role.arn,
-                                               task_role_arn=app_task_role.arn,
-                                               container_definitions=json.dumps([{
-                                                   "name": "redis",
-                                                   "image": "redis:alpine",
-                                                   "memory": 512,
-                                                   "cpu": 256,
-                                                   "essential": True,
-                                                   "portMappings": [{
-                                                       "containerPort": int(redis_port),
-                                                       "hostPort": int(redis_port),
-                                                       "protocol": "tcp"
-                                                   }],
-                                                   "logConfiguration": {
-                                                       "logDriver": "awslogs",
-                                                       "options": {
-                                                           "awslogs-group": "django-log-group",
-                                                           "awslogs-region": availability_zone,
-                                                           "awslogs-stream-prefix": "djangoApp-redis",
-                                                       },
-                                                   }
-                                               }]),
-                                               requires_compatibilities=["FARGATE"],
-                                               cpu="256",
-                                               memory="512"
-                                               )
-
-# Create an ECS service for Redis
-redis_service = aws.ecs.Service("redis-service",
-                                cluster=app_cluster.arn,
-                                desired_count=1,
-                                launch_type="FARGATE",
-                                task_definition=redis_task_definition.arn,
-                                network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
-                                    assign_public_ip=True,
-                                    subnets=[app_vpc_subnet.id],
-                                    security_groups=[app_security_group.id],
-                                ),
-
-                                )
-
-redis_dns_name = redis_balancer.dns_name
+redis_endpoint = redis_service.cache_nodes[0]["address"]
 django_dns_name = django_balancer.dns_name
 
 django_image = docker.Image(
@@ -416,7 +352,7 @@ django_site_task_definition = aws.ecs.TaskDefinition(
                         "value": mysql_rds_server.port.apply(lambda x: str(int(x))),
                     },
                     {"name": "ALLOWED_HOSTS", "value": django_dns_name},  #TODO how to fix this?
-                    {"name": "REDIS_HOST", "value": redis_dns_name},
+                    {"name": "REDIS_HOST", "value": redis_endpoint},
                     {"name": "REDIS_PORT", "value": redis_port},
                 ],
                 "logConfiguration": {
@@ -498,7 +434,7 @@ celery_site_task_definition = aws.ecs.TaskDefinition(
                         "name": "DATABASE_PORT",
                         "value": mysql_rds_server.port.apply(lambda x: str(int(x))),
                     },
-                    {"name": "REDIS_HOST", "value": redis_dns_name},
+                    {"name": "REDIS_HOST", "value": redis_endpoint},
                     {"name": "REDIS_PORT", "value": redis_port},
                 ],
                 "logConfiguration": {
@@ -536,3 +472,4 @@ celery_site_service = aws.ecs.Service(
 pulumi.export("app-url",  django_balancer.dns_name)
 pulumi.export("rds_endpoint", mysql_rds_server.endpoint)
 pulumi.export("secret value", django_admin_password)
+pulumi.export("redis service", redis_endpoint)
